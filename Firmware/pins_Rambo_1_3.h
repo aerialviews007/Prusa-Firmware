@@ -17,6 +17,8 @@
 #define D_REQUIRE		23	//Z_MAX (white)
 #endif //MICROMETER_LOGGING
 
+// This should be long enough to safely exit the bootloader when it uses the default timeout (~1-2s)
+#define WATCHDOG_SOFT_RESET_VALUE WDTO_2S
 
 
 #define X_STEP_PIN             37
@@ -60,6 +62,8 @@
 #define TEMP_PINDA_PIN          1 //A1
 
 
+#define TEMP_TIM 3
+
 
 #define E0_STEP_PIN            34
 #define E0_DIR_PIN             43
@@ -79,7 +83,7 @@
 #define PS_ON_PIN           -1
 #define KILL_PIN            -1  // 80 with Smart Controller LCD
 #define SUICIDE_PIN         -1  // PIN that has to be turned on right after start, to keep power flowing.
-#define TACH_0				30	// noctua extruder fan
+#define TACH_0				30	// noctua hotend fan
 
 
 //#define KILL_PIN            32

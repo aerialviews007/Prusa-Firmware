@@ -55,6 +55,7 @@
 #include "planner.h"
 #include "stepper.h"
 #include "temperature.h"
+#include "fancheck.h"
 #include "ultralcd.h"
 #include "language.h"
 #include "ConfigurationStore.h"
@@ -67,6 +68,9 @@
 #ifdef TMC2130
 #include "tmc2130.h"
 #endif //TMC2130
+
+#include <util/atomic.h>
+
 
 //===========================================================================
 //=============================public variables ============================
@@ -95,16 +99,12 @@ static float previous_speed[NUM_AXIS]; // Speed of previous path line segment
 static float previous_nominal_speed; // Nominal speed of previous path line segment
 static float previous_safe_speed; // Exit speed limited by a jerk to full halt of a previous last segment.
 
-uint8_t maxlimit_status;
-
 #ifdef AUTOTEMP
 float autotemp_max=250;
 float autotemp_min=210;
 float autotemp_factor=0.1;
 bool autotemp_enabled=false;
 #endif
-
-unsigned char g_uc_extruder_last_move[3] = {0,0,0};
 
 //===========================================================================
 //=================semi-private variables, used in inline  functions    =====
@@ -122,7 +122,7 @@ static uint8_t g_cntr_planner_queue_min = 0;
 //=============================private variables ============================
 //===========================================================================
 #ifdef PREVENT_DANGEROUS_EXTRUDE
-float extrude_min_temp=EXTRUDE_MINTEMP;
+int extrude_min_temp = EXTRUDE_MINTEMP;
 #endif
 
 #ifdef LIN_ADVANCE
@@ -507,7 +507,7 @@ void getHighESpeed()
     t=AUTOTEMP_OLDWEIGHT*oldt+(1-AUTOTEMP_OLDWEIGHT)*t;
   }
   oldt=t;
-  setTargetHotend0(t);
+  setTargetHotend(t);
 }
 #endif
 
@@ -592,17 +592,7 @@ void check_axes_activity()
 #endif
 }
 
-bool waiting_inside_plan_buffer_line_print_aborted = false;
-/*
-void planner_abort_soft()
-{
-    // Empty the queue.
-    while (blocks_queued()) plan_discard_current_block();
-    // Relay to planner wait routine, that the current line shall be canceled.
-    waiting_inside_plan_buffer_line_print_aborted = true;
-    //current_position[i]
-}
-*/
+bool planner_aborted = false;
 
 #ifdef PLANNER_DIAGNOSTICS
 static inline void planner_update_queue_min_counter()
@@ -615,12 +605,8 @@ static inline void planner_update_queue_min_counter()
 
 extern volatile uint32_t step_events_completed; // The number of step events executed in the current block
 
-void planner_abort_hard()
+void planner_reset_position()
 {
-    // Abort the stepper routine and flush the planner queue.
-    DISABLE_STEPPER_DRIVER_INTERRUPT();
-
-    // Now the front-end (the Marlin_main.cpp with its current_position) is out of sync.
     // First update the planner's current position in the physical motor steps.
     position[X_AXIS] = st_get_position(X_AXIS);
     position[Y_AXIS] = st_get_position(Y_AXIS);
@@ -632,6 +618,7 @@ void planner_abort_hard()
     current_position[Y_AXIS] = st_get_position_mm(Y_AXIS);
     current_position[Z_AXIS] = st_get_position_mm(Z_AXIS);
     current_position[E_AXIS] = st_get_position_mm(E_AXIS);
+
     // Apply the mesh bed leveling correction to the Z axis.
 #ifdef MESH_BED_LEVELING
     if (mbl.active) {
@@ -664,32 +651,44 @@ void planner_abort_hard()
 #endif
     }
 #endif
-    // Clear the planner queue, reset and re-enable the stepper timer.
-    quickStop();
 
     // Apply inverse world correction matrix.
     machine2world(current_position[X_AXIS], current_position[Y_AXIS]);
-    memcpy(destination, current_position, sizeof(destination));
+    set_destination_to_current();
 #ifdef LIN_ADVANCE
     memcpy(position_float, current_position, sizeof(position_float));
 #endif
+}
+
+void planner_abort_hard()
+{
+    // Abort the stepper routine and flush the planner queue.
+    DISABLE_STEPPER_DRIVER_INTERRUPT();
+
+    // Now the front-end (the Marlin_main.cpp with its current_position) is out of sync.
+    planner_reset_position();
+
+    // Relay to planner wait routine that the current line shall be canceled.
+    planner_aborted = true;
+
+    // Clear the planner queue, reset and re-enable the stepper timer.
+    quickStop();
+
     // Resets planner junction speeds. Assumes start from rest.
     previous_nominal_speed = 0.0;
     memset(previous_speed, 0, sizeof(previous_speed));
 
+    // Reset position sync requests
     plan_reset_next_e_queue = false;
     plan_reset_next_e_sched = false;
-
-    // Relay to planner wait routine, that the current line shall be canceled.
-    waiting_inside_plan_buffer_line_print_aborted = true;
 }
 
 void plan_buffer_line_curposXYZE(float feed_rate) {
-    plan_buffer_line(current_position[X_AXIS], current_position[Y_AXIS], current_position[Z_AXIS], current_position[E_AXIS], feed_rate, active_extruder );
+    plan_buffer_line(current_position[X_AXIS], current_position[Y_AXIS], current_position[Z_AXIS], current_position[E_AXIS], feed_rate);
 }
 
 void plan_buffer_line_destinationXYZE(float feed_rate) {
-    plan_buffer_line(destination[X_AXIS], destination[Y_AXIS], destination[Z_AXIS], destination[E_AXIS], feed_rate, active_extruder);
+    plan_buffer_line(destination[X_AXIS], destination[Y_AXIS], destination[Z_AXIS], destination[E_AXIS], feed_rate);
 }
 
 void plan_set_position_curposXYZE(){
@@ -700,14 +699,17 @@ float junction_deviation = 0.1;
 // Add a new linear movement to the buffer. steps_x, _y and _z is the absolute position in 
 // mm. Microseconds specify how many microseconds the move should take to perform. To aid acceleration
 // calculation the caller must also provide the physical length of the line in millimeters.
-void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate, uint8_t extruder, const float* gcode_target)
+void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate, const float* gcode_start_position, uint16_t segment_idx)
 {
-    // Calculate the buffer head after we push this byte
+  // CRITICAL_SECTION_START; //prevent stack overflow in ISR
+  // printf_P(PSTR("plan_buffer_line(%f, %f, %f, %f, %f, %u, [%f,%f,%f,%f], %u)\n"), x, y, z, e, feed_rate, extruder, gcode_start_position[0], gcode_start_position[1], gcode_start_position[2], gcode_start_position[3], segment_idx);
+  // CRITICAL_SECTION_END;
+
+  // Calculate the buffer head after we push this byte
   uint8_t next_buffer_head = next_block_index(block_buffer_head);
 
-  // If the buffer is full: good! That means we are well ahead of the robot. 
+  // If the buffer is full: good! That means we are well ahead of the robot.
   // Rest here until there is room in the buffer.
-  waiting_inside_plan_buffer_line_print_aborted = false;
   if (block_buffer_tail == next_buffer_head) {
       do {
           manage_heater(); 
@@ -715,18 +717,14 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
           manage_inactivity(false); 
           lcd_update(0);
       } while (block_buffer_tail == next_buffer_head);
-      if (waiting_inside_plan_buffer_line_print_aborted) {
-          // Inside the lcd_update(0) routine the print has been aborted.
-          // Cancel the print, do not plan the current line this routine is waiting on.
-#ifdef PLANNER_DIAGNOSTICS
-          planner_update_queue_min_counter();
-#endif /* PLANNER_DIAGNOSTICS */
-          return;
-      }
   }
 #ifdef PLANNER_DIAGNOSTICS
   planner_update_queue_min_counter();
 #endif /* PLANNER_DIAGNOSTICS */
+  if(planner_aborted) {
+      // avoid planning the block early if aborted
+      return;
+  }
 
   // Prepare to set up new block
   block_t *block = &block_buffer[block_buffer_head];
@@ -737,16 +735,14 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
   // Set sdlen for calculating sd position
   block->sdlen = 0;
 
-  // Save original destination of the move
-  if (gcode_target)
-      memcpy(block->gcode_target, gcode_target, sizeof(block_t::gcode_target));
+  // Save original start position of the move
+  if (gcode_start_position)
+      memcpy(block->gcode_start_position, gcode_start_position, sizeof(block_t::gcode_start_position));
   else
-  {
-      block->gcode_target[X_AXIS] = x;
-      block->gcode_target[Y_AXIS] = y;
-      block->gcode_target[Z_AXIS] = z;
-      block->gcode_target[E_AXIS] = e;
-  }
+      memcpy(block->gcode_start_position, current_position, sizeof(block_t::gcode_start_position));
+  
+  // Save the index of this segment (when a single G0/1/2/3 command plans multiple segments)
+  block->segment_idx = segment_idx;
 
   // Save the global feedrate at scheduling time
   block->gcode_feedrate = feedrate;
@@ -829,27 +825,36 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
     target[Z_AXIS] = lround(z*cs.axis_steps_per_unit[Z_AXIS]);
 #endif // ENABLE_MESH_BED_LEVELING
   target[E_AXIS] = lround(e*cs.axis_steps_per_unit[E_AXIS]);
+
+  // Calculate subtraction to re-use result in many places
+  // This saves memory and speeds up calculations
+  int32_t de = target[E_AXIS] - position[E_AXIS];
+  int32_t dx = target[X_AXIS] - position[X_AXIS];
+  int32_t dy = target[Y_AXIS] - position[Y_AXIS];
+  int32_t dz = target[Z_AXIS] - position[Z_AXIS];
   
   #ifdef PREVENT_DANGEROUS_EXTRUDE
-  if(target[E_AXIS]!=position[E_AXIS])
+  if(de)
   {
-    if(degHotend(active_extruder)<extrude_min_temp)
+    if((int)degHotend(active_extruder)<extrude_min_temp)
     {
       position[E_AXIS]=target[E_AXIS]; //behave as if the move really took place, but ignore E part
       #ifdef LIN_ADVANCE
       position_float[E_AXIS] = e;
       #endif
+      de = 0; // no difference
       SERIAL_ECHO_START;
       SERIAL_ECHOLNRPGM(_n(" cold extrusion prevented"));////MSG_ERR_COLD_EXTRUDE_STOP
     }
     
     #ifdef PREVENT_LENGTHY_EXTRUDE
-    if(labs(target[E_AXIS]-position[E_AXIS])>cs.axis_steps_per_unit[E_AXIS]*EXTRUDE_MAXLENGTH)
+    if(labs(de) > cs.axis_steps_per_unit[E_AXIS]*EXTRUDE_MAXLENGTH)
     {
       position[E_AXIS]=target[E_AXIS]; //behave as if the move really took place, but ignore E part
       #ifdef LIN_ADVANCE
       position_float[E_AXIS] = e;
       #endif
+      de = 0; // no difference
       SERIAL_ECHO_START;
       SERIAL_ECHOLNRPGM(_n(" too long extrusion prevented"));////MSG_ERR_LONG_EXTRUDE_STOP
     }
@@ -860,16 +865,16 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
   // Number of steps for each axis
 #ifndef COREXY
 // default non-h-bot planning
-block->steps_x.wide = labs(target[X_AXIS]-position[X_AXIS]);
-block->steps_y.wide = labs(target[Y_AXIS]-position[Y_AXIS]);
+block->steps_x.wide = labs(dx);
+block->steps_y.wide = labs(dy);
 #else
 // corexy planning
 // these equations follow the form of the dA and dB equations on http://www.corexy.com/theory.html
-block->steps_x.wide = labs((target[X_AXIS]-position[X_AXIS]) + (target[Y_AXIS]-position[Y_AXIS]));
-block->steps_y.wide = labs((target[X_AXIS]-position[X_AXIS]) - (target[Y_AXIS]-position[Y_AXIS]));
+block->steps_x.wide = labs(dx + dy);
+block->steps_y.wide = labs(dx - dy);
 #endif
-  block->steps_z.wide = labs(target[Z_AXIS]-position[Z_AXIS]);
-  block->steps_e.wide = labs(target[E_AXIS]-position[E_AXIS]);
+  block->steps_z.wide = labs(dz);
+  block->steps_e.wide = labs(de);
   block->step_event_count.wide = max(block->steps_x.wide, max(block->steps_y.wide, max(block->steps_z.wide, block->steps_e.wide)));
 
   // Bail if this is a zero-length block
@@ -883,37 +888,17 @@ block->steps_y.wide = labs((target[X_AXIS]-position[X_AXIS]) - (target[Y_AXIS]-p
 
   block->fan_speed = fanSpeed;
 
-  // Compute direction bits for this block 
+  // Compute direction bits for this block
   block->direction_bits = 0;
 #ifndef COREXY
-  if (target[X_AXIS] < position[X_AXIS])
-  {
-    block->direction_bits |= (1<<X_AXIS); 
-  }
-  if (target[Y_AXIS] < position[Y_AXIS])
-  {
-    block->direction_bits |= (1<<Y_AXIS); 
-  }
+  if (dx < 0) block->direction_bits |= _BV(X_AXIS);
+  if (dy < 0) block->direction_bits |= _BV(Y_AXIS);
 #else
-  if ((target[X_AXIS]-position[X_AXIS]) + (target[Y_AXIS]-position[Y_AXIS]) < 0)
-  {
-    block->direction_bits |= (1<<X_AXIS); 
-  }
-  if ((target[X_AXIS]-position[X_AXIS]) - (target[Y_AXIS]-position[Y_AXIS]) < 0)
-  {
-    block->direction_bits |= (1<<Y_AXIS); 
-  }
+  if (dx + dy < 0) block->direction_bits |= _BV(X_AXIS);
+  if (dx - dy < 0) block->direction_bits |= _BV(Y_AXIS);
 #endif
-  if (target[Z_AXIS] < position[Z_AXIS])
-  {
-    block->direction_bits |= (1<<Z_AXIS); 
-  }
-  if (target[E_AXIS] < position[E_AXIS])
-  {
-    block->direction_bits |= (1<<E_AXIS); 
-  }
-
-  block->active_extruder = extruder;
+  if (dz < 0) block->direction_bits |= _BV(Z_AXIS);
+  if (de < 0) block->direction_bits |= _BV(E_AXIS);
 
   //enable active axes
   #ifdef COREXY
@@ -927,49 +912,7 @@ block->steps_y.wide = labs((target[X_AXIS]-position[X_AXIS]) - (target[Y_AXIS]-p
   if(block->steps_y.wide != 0) enable_y();
   #endif
   if(block->steps_z.wide != 0) enable_z();
-
-  // Enable extruder(s)
-  if(block->steps_e.wide != 0)
-  {
-    if (DISABLE_INACTIVE_EXTRUDER) //enable only selected extruder
-    {
-
-      if(g_uc_extruder_last_move[0] > 0) g_uc_extruder_last_move[0]--;
-      if(g_uc_extruder_last_move[1] > 0) g_uc_extruder_last_move[1]--;
-      if(g_uc_extruder_last_move[2] > 0) g_uc_extruder_last_move[2]--;
-      
-      switch(extruder)
-      {
-        case 0: 
-          enable_e0(); 
-          g_uc_extruder_last_move[0] = BLOCK_BUFFER_SIZE*2;
-          
-          if(g_uc_extruder_last_move[1] == 0) {disable_e1();}
-          if(g_uc_extruder_last_move[2] == 0) {disable_e2();}
-        break;
-        case 1:
-          enable_e1(); 
-          g_uc_extruder_last_move[1] = BLOCK_BUFFER_SIZE*2;
-          
-          if(g_uc_extruder_last_move[0] == 0) {disable_e0();}
-          if(g_uc_extruder_last_move[2] == 0) {disable_e2();}
-        break;
-        case 2:
-          enable_e2(); 
-          g_uc_extruder_last_move[2] = BLOCK_BUFFER_SIZE*2;
-          
-          if(g_uc_extruder_last_move[0] == 0) {disable_e0();}
-          if(g_uc_extruder_last_move[1] == 0) {disable_e1();}
-        break;        
-      }
-    }
-    else //enable all
-    {
-      enable_e0();
-      enable_e1();
-      enable_e2(); 
-    }
-  }
+  if(block->steps_e.wide != 0) enable_e0();
 
   if (block->steps_e.wide == 0)
   {
@@ -989,17 +932,17 @@ Having the real displacement of the head, we can calculate the total movement le
 */ 
   #ifndef COREXY
     float delta_mm[4];
-    delta_mm[X_AXIS] = (target[X_AXIS]-position[X_AXIS])/cs.axis_steps_per_unit[X_AXIS];
-    delta_mm[Y_AXIS] = (target[Y_AXIS]-position[Y_AXIS])/cs.axis_steps_per_unit[Y_AXIS];
+    delta_mm[X_AXIS] = dx / cs.axis_steps_per_unit[X_AXIS];
+    delta_mm[Y_AXIS] = dy / cs.axis_steps_per_unit[Y_AXIS];
   #else
     float delta_mm[6];
-    delta_mm[X_HEAD] = (target[X_AXIS]-position[X_AXIS])/cs.axis_steps_per_unit[X_AXIS];
-    delta_mm[Y_HEAD] = (target[Y_AXIS]-position[Y_AXIS])/cs.axis_steps_per_unit[Y_AXIS];
-    delta_mm[X_AXIS] = ((target[X_AXIS]-position[X_AXIS]) + (target[Y_AXIS]-position[Y_AXIS]))/cs.axis_steps_per_unit[X_AXIS];
-    delta_mm[Y_AXIS] = ((target[X_AXIS]-position[X_AXIS]) - (target[Y_AXIS]-position[Y_AXIS]))/cs.axis_steps_per_unit[Y_AXIS];
+    delta_mm[X_HEAD] = dx / cs.axis_steps_per_unit[X_AXIS];
+    delta_mm[Y_HEAD] = dy / cs.axis_steps_per_unit[Y_AXIS];
+    delta_mm[X_AXIS] = (dx + dy) / cs.axis_steps_per_unit[X_AXIS];
+    delta_mm[Y_AXIS] = (dx - dy) / cs.axis_steps_per_unit[Y_AXIS];
   #endif
-  delta_mm[Z_AXIS] = (target[Z_AXIS]-position[Z_AXIS])/cs.axis_steps_per_unit[Z_AXIS];
-  delta_mm[E_AXIS] = (target[E_AXIS]-position[E_AXIS])/cs.axis_steps_per_unit[E_AXIS];
+  delta_mm[Z_AXIS] = dz / cs.axis_steps_per_unit[Z_AXIS];
+  delta_mm[E_AXIS] = de / cs.axis_steps_per_unit[E_AXIS];
   if ( block->steps_x.wide <=dropsegments && block->steps_y.wide <=dropsegments && block->steps_z.wide <=dropsegments )
   {
     block->millimeters = fabs(delta_mm[E_AXIS]);
@@ -1331,8 +1274,12 @@ Having the real displacement of the head, we can calculate the total movement le
   if (block->step_event_count.wide <= 32767)
     block->flag |= BLOCK_FLAG_DDA_LOWRES;
 
-  // Move the buffer head. From now the block may be picked up by the stepper interrupt controller.
-  block_buffer_head = next_buffer_head;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      // Move the buffer head ensuring the current block hasn't been cancelled from an isr context
+      // (this is possible both during crash detection *and* uvlo, thus needing a global cli)
+      if(planner_aborted) return;
+      block_buffer_head = next_buffer_head;
+  }
 
   // Update position
   memcpy(position, target, sizeof(target)); // position[] = target[]
@@ -1434,9 +1381,9 @@ void plan_reset_next_e()
 }
 
 #ifdef PREVENT_DANGEROUS_EXTRUDE
-void set_extrude_min_temp(float temp)
+void set_extrude_min_temp(int temp)
 {
-  extrude_min_temp=temp;
+  extrude_min_temp = temp;
 }
 #endif
 
